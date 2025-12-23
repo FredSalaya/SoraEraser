@@ -74,76 +74,84 @@ def process_video_frames(input_path: str, output_path: str):
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
     # Load Watermark Template
-    # Assuming whatermark.svg is in the root directory
     svg_path = "whatermark.svg"
-    template, wm_mask = load_watermark_from_svg(svg_path)
+    base_template, _ = load_watermark_from_svg(svg_path)
     
-    # Fallback kernel if SVG fails or for additional dilation
-    kernel = np.ones((5,5), np.uint8) # Increased kernel size slightly
+    # Pre-compute scaled templates for robustness
+    templates = []
+    if base_template is not None:
+        for scale in [0.8, 0.9, 1.0, 1.1, 1.2]:
+            t_h, t_w = base_template.shape
+            scaled_w = int(t_w * scale)
+            scaled_h = int(t_h * scale)
+            # Ensure not too small
+            if scaled_w > 10 and scaled_h > 10:
+                resized_t = cv2.resize(base_template, (scaled_w, scaled_h))
+                templates.append((resized_t, scale))
+    
+    # Kernel for dilation
+    kernel = np.ones((5,5), np.uint8)
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
             
-        final_mask = None
+        final_mask = np.zeros((height, width), dtype=np.uint8)
+        found_match = False
         
-        # If we successfully loaded the SVG, try to find it
-        if template is not None and wm_mask is not None:
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Template matching
-            # TM_CCOEFF_NORMED is good for lighting invariance
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 1. Multi-scale Search
+        best_match = None
+        best_val = -1
+        
+        for template, scale in templates:
+            # Skip if template is larger than frame
+            if template.shape[0] > height or template.shape[1] > width:
+                continue
+                
             res = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
             
-            # Threshold for detection
-            if max_val > 0.6: # Confidence threshold
-                top_left = max_loc
-                h, w = template.shape
-                
-                # Create a mask for the whole frame
-                full_mask = np.zeros((height, width), dtype=np.uint8)
-                
-                # Copy the watermark mask to the detected location
-                # Handle boundaries
-                y1, y2 = top_left[1], top_left[1] + h
-                x1, x2 = top_left[0], top_left[0] + w
-                
-                # Clip to frame dimensions
-                y1_cl, y2_cl = max(0, y1), min(height, y2)
-                x1_cl, x2_cl = max(0, x1), min(width, x2)
-                
-                # Calculate offsets for the mask source
-                my1, my2 = y1_cl - y1, (y1_cl - y1) + (y2_cl - y1_cl)
-                mx1, mx2 = x1_cl - x1, (x1_cl - x1) + (x2_cl - x1_cl)
-                
-                if y2_cl > y1_cl and x2_cl > x1_cl:
-                     full_mask[y1_cl:y2_cl, x1_cl:x2_cl] = wm_mask[my1:my2, mx1:mx2]
-                     final_mask = full_mask
-
-        # Fallback to old method if not found (or combine?)
-        # For now, if found, use it. If not, maybe use old method?
-        # User said "para poder detectar mejor", implying the old one was bad.
-        # But if the watermark is missing in a frame (unlikely) or detection fails,
-        # we might want to fallback. However, mixing random thresholding might retain the bad behavior.
-        # Let's try: If found, use SVG mask. If not found, do nothing (pass frame).
-        # OR: Combine. 
-        # Let's perform the thresholding as a backup usually, OR just trust the template.
-        # Given "better detect", I will fallback to thresholding if low confidence, 
-        # but thresholding was "detecting white pixels".
+            if max_val > best_val:
+                best_val = max_val
+                best_match = (max_loc, template)
         
-        if final_mask is None:
-             # Fallback logic: Simple thresholding (Original)
-             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-             _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY) # Increased threshold slightly
+        # Check if our best match is good enough
+        # Threshold 0.45 is a balanced choice
+        if best_val > 0.45 and best_match:
+            top_left, match_template = best_match
+            h, w = match_template.shape
+            
+            y1, y2 = top_left[1], top_left[1] + h
+            x1, x2 = top_left[0], top_left[0] + w
+            
+            y1_cl, y2_cl = max(0, y1), min(height, y2)
+            x1_cl, x2_cl = max(0, x1), min(width, x2)
+            
+            if y2_cl > y1_cl and x2_cl > x1_cl:
+                # ROI Masking
+                roi_gray = gray_frame[y1_cl:y2_cl, x1_cl:x2_cl]
+                
+                # Blur specifically to remove noise text/edges
+                roi_blur = cv2.GaussianBlur(roi_gray, (3,3), 0)
+                
+                # Threshold to find white content
+                _, roi_mask = cv2.threshold(roi_blur, 190, 255, cv2.THRESH_BINARY)
+                
+                final_mask[y1_cl:y2_cl, x1_cl:x2_cl] = roi_mask
+                found_match = True
+
+        # 3. Fallback: only if confidence is low
+        if not found_match:
+             _, thresh = cv2.threshold(gray_frame, 240, 255, cv2.THRESH_BINARY)
              final_mask = thresh
 
-        # Dilate mask to cover edges
+        # Dilate mask 
         final_mask = cv2.dilate(final_mask, kernel, iterations=1)
         
         # Inpaint
-        # Radius 3 is typical
         cleaned_frame = cv2.inpaint(frame, final_mask, 3, cv2.INPAINT_TELEA)
         
         out.write(cleaned_frame)
